@@ -44,6 +44,7 @@ enum ModalPhase {
     Scanning,
     Reviewing,
     Normalizing,
+    Cancelling,
 }
 
 enum NormalizeMessage {
@@ -56,6 +57,7 @@ enum NormalizeMessage {
         candidates: Vec<Candidate>,
         errors: Vec<String>,
     },
+    ScanCancelled,
     NormalizeComplete {
         index: usize,
         result: Result<(), String>,
@@ -74,6 +76,13 @@ struct NormalizeModal {
     receiver: Receiver<NormalizeMessage>,
 }
 
+struct PlaybackState {
+    description: String,
+    cancelled: Arc<AtomicBool>,
+    stopping: bool,
+    receiver: Receiver<Result<(), String>>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -88,8 +97,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         list_state.select(Some(0));
     }
     let mut normalization: Option<NormalizeModal> = None;
+    let mut playback: Option<PlaybackState> = None;
+    let mut playback_notice: Option<String> = None;
+    let mut quit_after_playback = false;
 
     loop {
+        let playback_result = playback
+            .as_ref()
+            .and_then(|active| active.receiver.try_recv().ok());
+        if let Some(result) = playback_result {
+            let was_stopping = playback.as_ref().is_some_and(|active| active.stopping);
+            playback = None;
+            playback_notice = Some(match result {
+                Ok(()) if was_stopping => "Playback stopped".to_string(),
+                Ok(()) => "Playback complete".to_string(),
+                Err(error) => format!("Playback error: {error}"),
+            });
+        }
+
+        if quit_after_playback && playback.is_none() {
+            break;
+        }
+
+        let mut close_normalization = false;
         if let Some(modal) = normalization.as_mut() {
             while let Ok(message) = modal.receiver.try_recv() {
                 match message {
@@ -99,24 +129,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         modal.current = name;
                     }
                     NormalizeMessage::ScanComplete { candidates, errors } => {
-                        modal.candidates = candidates;
-                        modal.errors = errors;
-                        modal.phase = ModalPhase::Reviewing;
-                        modal.current.clear();
-                        modal.selected = 0;
+                        if modal.phase == ModalPhase::Cancelling {
+                            close_normalization = true;
+                        } else {
+                            modal.candidates = candidates;
+                            modal.errors = errors;
+                            modal.phase = ModalPhase::Reviewing;
+                            modal.current.clear();
+                            modal.selected = 0;
+                        }
+                    }
+                    NormalizeMessage::ScanCancelled => {
+                        close_normalization = true;
                     }
                     NormalizeMessage::NormalizeComplete { index, result } => {
-                        if let Some(candidate) = modal.candidates.get_mut(index) {
-                            candidate.state = match result {
-                                Ok(()) => CandidateState::Normalized,
-                                Err(error) => CandidateState::Failed(error),
-                            };
+                        if modal.phase == ModalPhase::Cancelling
+                            || matches!(&result, Err(error) if error == "Cancelled")
+                        {
+                            close_normalization = true;
+                        } else {
+                            if let Some(candidate) = modal.candidates.get_mut(index) {
+                                candidate.state = match result {
+                                    Ok(()) => CandidateState::Normalized,
+                                    Err(error) => CandidateState::Failed(error),
+                                };
+                            }
+                            modal.phase = ModalPhase::Reviewing;
+                            modal.current.clear();
                         }
-                        modal.phase = ModalPhase::Reviewing;
-                        modal.current.clear();
                     }
                 }
             }
+        }
+        if close_normalization {
+            normalization = None;
         }
 
         terminal.draw(|f| {
@@ -152,7 +198,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-            let status_text = " [↑/↓] Select  |  [ENTER] Open / Play  |  [N] Normalize  |  [R] Refresh  |  [Q] Quit";
+            let status_text = if let Some(active) = playback.as_ref() {
+                if active.stopping {
+                    format!("Stopping {}...", active.description)
+                } else {
+                    format!(
+                        "Playing {} | [S] Stop | Sequence locked | [Q] Stop and Quit",
+                        active.description
+                    )
+                }
+            } else if let Some(notice) = playback_notice.as_ref() {
+                format!(
+                    "[↑/↓] Select | [ENTER] Open / Play | [N] Normalize | [R] Refresh | [Q] Quit | {notice}"
+                )
+            } else {
+                " [↑/↓] Select  |  [ENTER] Open / Play  |  [N] Normalize  |  [R] Refresh  |  [Q] Quit".to_string()
+            };
             let status = Paragraph::new(status_text)
                 .block(Block::default().borders(Borders::ALL).title(" Controls "));
             f.render_widget(status, chunks[1]);
@@ -170,8 +231,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(modal) = normalization.as_mut() {
                 match key.code {
                     KeyCode::Esc => {
-                        modal.cancelled.store(true, Ordering::Relaxed);
-                        normalization = None;
+                        if modal.phase == ModalPhase::Reviewing {
+                            normalization = None;
+                        } else if modal.phase != ModalPhase::Cancelling {
+                            modal.cancelled.store(true, Ordering::Relaxed);
+                            modal.phase = ModalPhase::Cancelling;
+                            modal.current = "Waiting for worker to stop".to_string();
+                        }
                     }
                     KeyCode::Up if modal.phase == ModalPhase::Reviewing => {
                         if modal.selected > 0 {
@@ -199,13 +265,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            if let Some(active) = playback.as_mut() {
+                match key.code {
+                    KeyCode::Char('s' | 'S') => {
+                        active.stopping = true;
+                        active.cancelled.store(true, Ordering::Relaxed);
+                    }
+                    KeyCode::Char('q' | 'Q') => {
+                        active.stopping = true;
+                        active.cancelled.store(true, Ordering::Relaxed);
+                        quit_after_playback = true;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Char('r') => {
+                KeyCode::Char('q' | 'Q') => break,
+                KeyCode::Char('r' | 'R') => {
                     entries = scan_dir(&current_dir);
                     list_state.select(if entries.is_empty() { None } else { Some(0) });
                 }
-                KeyCode::Char('n') => {
+                KeyCode::Char('n' | 'N') => {
                     normalization = Some(start_scan(&entries));
                 }
                 KeyCode::Down => {
@@ -231,8 +313,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 list_state.select(if entries.is_empty() { None } else { Some(0) });
                             } else if !matches!(entry.side, TrackSide::Unmatched) {
                                 let entries_clone = entries.clone();
+                                let track_name = entry.name.clone();
+                                let cancelled = Arc::new(AtomicBool::new(false));
+                                let worker_cancelled = Arc::clone(&cancelled);
+                                let (sender, receiver) = mpsc::channel();
                                 thread::spawn(move || {
-                                    audio::play_sequence_from(&entries_clone, selected, 2);
+                                    let result = audio::play_sequence_from(
+                                        &entries_clone,
+                                        selected,
+                                        2,
+                                        &worker_cancelled,
+                                    );
+                                    let _ = sender.send(result);
+                                });
+                                playback_notice = None;
+                                playback = Some(PlaybackState {
+                                    description: track_name,
+                                    cancelled,
+                                    stopping: false,
+                                    receiver,
                                 });
                             }
                         }
@@ -265,6 +364,7 @@ fn start_scan(entries: &[FileEntry]) -> NormalizeModal {
 
         for (index, entry) in tracks.into_iter().enumerate() {
             if worker_cancelled.load(Ordering::Relaxed) {
+                let _ = sender.send(NormalizeMessage::ScanCancelled);
                 return;
             }
             if sender
@@ -290,7 +390,10 @@ fn start_scan(entries: &[FileEntry]) -> NormalizeModal {
                 Err(error) if error != "Cancelled" => {
                     errors.push(format!("{}: {error}", entry.name));
                 }
-                Err(_) => return,
+                Err(_) => {
+                    let _ = sender.send(NormalizeMessage::ScanCancelled);
+                    return;
+                }
             }
         }
 
@@ -364,6 +467,14 @@ fn draw_normalization_modal(frame: &mut Frame, modal: &NormalizeModal) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Normalize Track "),
+            );
+            frame.render_widget(paragraph, area);
+        }
+        ModalPhase::Cancelling => {
+            let paragraph = Paragraph::new(modal.current.as_str()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Stopping Worker "),
             );
             frame.render_widget(paragraph, area);
         }
