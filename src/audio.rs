@@ -1,8 +1,8 @@
+use crate::track::FileEntry;
 use rodio::{Decoder, OutputStream, Sink, Source};
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use crate::track::FileEntry;
 
 pub fn play_sequence_from(entries: &[FileEntry], start_index: usize, silence_secs: u64) {
     let target_side = match &entries[start_index].side {
@@ -14,21 +14,27 @@ pub fn play_sequence_from(entries: &[FileEntry], start_index: usize, silence_sec
     let (_stream, handle) = OutputStream::try_default().unwrap();
     let sink = Sink::try_new(&handle).unwrap();
 
-    // Filter to remaining tracks on the selected side from start_index onward
-    let remaining = entries.iter().enumerate().skip(start_index).filter(|(_, e)| {
-        std::mem::discriminant(&e.side) == std::mem::discriminant(&target_side)
-    });
+    let remaining: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .skip(start_index)
+        .filter(|(_, entry)| {
+            !entry.is_dir
+                && std::mem::discriminant(&entry.side) == std::mem::discriminant(&target_side)
+        })
+        .collect();
 
-    for (_, track) in remaining {
+    for (index, (_, track)) in remaining.iter().enumerate() {
         if let Ok(file) = File::open(&track.path) {
             if let Ok(decoder) = Decoder::new(BufReader::new(file)) {
                 // Buffer audio into memory to prevent disk skip
                 sink.append(decoder.buffered());
 
-                // Inter-track silence
-                let silence = rodio::source::Zero::<i16>::new(1, 44100)
-                    .take_duration(Duration::from_secs(silence_secs));
-                sink.append(silence);
+                if index + 1 < remaining.len() {
+                    let silence = rodio::source::Zero::<i16>::new(1, 44100)
+                        .take_duration(Duration::from_secs(silence_secs));
+                    sink.append(silence);
+                }
             }
         }
     }
