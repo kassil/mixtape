@@ -1,0 +1,10 @@
+[package]
+name = "mixtape"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.28"
+crossterm = "0.28"
+rodio = { version = "0.19", features = ["minimp3", "vorbis"] }
+regex = "1.11"
