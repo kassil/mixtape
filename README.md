@@ -13,3 +13,9 @@ ffmpeg -version
 ```
 
 If FFmpeg cannot be started, mixtape shows the affected filenames and the reason in the scan review modal.
+
+## Track durations
+
+Track lengths are loaded in the background when a directory is opened. The main view shows each track length and the total time for Side A and Side B. Totals include the pause between adjacent tracks.
+
+Use `[` and `]` to decrease or increase the pause by one second. The default pause is two seconds.

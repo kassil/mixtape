@@ -5,6 +5,17 @@ use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+pub const DEFAULT_SILENCE_SECS: u64 = 2;
+
+pub fn track_duration(path: &std::path::Path) -> Result<Duration, String> {
+    let file = File::open(path).map_err(|error| format!("Could not open track: {error}"))?;
+    let decoder = Decoder::new(BufReader::new(file))
+        .map_err(|error| format!("Could not read track metadata: {error}"))?;
+    decoder
+        .total_duration()
+        .ok_or_else(|| "Track duration is unavailable".to_string())
+}
+
 pub fn play_sequence_from(
     entries: &[FileEntry],
     start_index: usize,

@@ -15,6 +15,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     sync::{
@@ -26,6 +27,13 @@ use std::{
     time::Duration,
 };
 use track::{scan_dir, FileEntry, TrackSide};
+
+enum DurationMessage {
+    Loaded {
+        path: PathBuf,
+        duration: Option<Duration>,
+    },
+}
 
 struct Candidate {
     entry: FileEntry,
@@ -92,6 +100,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut entries = scan_dir(&current_dir);
+    let (duration_sender, duration_receiver) = mpsc::channel();
+    let mut durations = HashMap::new();
+    load_durations(&entries, &duration_sender);
     let mut list_state = ListState::default();
     if !entries.is_empty() {
         list_state.select(Some(0));
@@ -100,8 +111,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback: Option<PlaybackState> = None;
     let mut playback_notice: Option<String> = None;
     let mut quit_after_playback = false;
+    let mut silence_secs = audio::DEFAULT_SILENCE_SECS;
 
     loop {
+        while let Ok(DurationMessage::Loaded { path, duration }) = duration_receiver.try_recv() {
+            durations.insert(path, duration);
+        }
+
         let playback_result = playback
             .as_ref()
             .and_then(|active| active.receiver.try_recv().ok());
@@ -168,7 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(3)].as_ref())
+                .constraints(
+                    [Constraint::Min(3), Constraint::Length(2), Constraint::Length(3)].as_ref(),
+                )
                 .split(f.area());
 
             let items: Vec<ListItem> = entries
@@ -178,8 +196,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format!("[{}]", e.name)
                     } else {
                         match e.side {
-                            TrackSide::SideA(num) => format!("[Side A {:02}] {}", num, e.name),
-                            TrackSide::SideB(num) => format!("[Side B {:02}] {}", num, e.name),
+                            TrackSide::SideA(num) => format!(
+                                "[Side A {:02}] {:>5} {}",
+                                num,
+                                format_duration(durations.get(&e.path).and_then(|duration| *duration)),
+                                e.name
+                            ),
+                            TrackSide::SideB(num) => format!(
+                                "[Side B {:02}] {:>5} {}",
+                                num,
+                                format_duration(durations.get(&e.path).and_then(|duration| *duration)),
+                                e.name
+                            ),
                             TrackSide::Unmatched => format!("[  Other  ] {}", e.name),
                         }
                     };
@@ -198,6 +226,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             f.render_stateful_widget(list, chunks[0], &mut list_state);
 
+            let totals = side_totals(&entries, &durations, silence_secs);
+            let totals_text = format!(
+                "Side A: {}    Side B: {}    Pause: {}s",
+                format_duration(totals.0),
+                format_duration(totals.1),
+                silence_secs
+            );
+            f.render_widget(
+                Paragraph::new(totals_text)
+                    .block(Block::default().borders(Borders::ALL).title(" Side totals ")),
+                chunks[1],
+            );
+
             let status_text = if let Some(active) = playback.as_ref() {
                 if active.stopping {
                     format!("Stopping {}...", active.description)
@@ -209,14 +250,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else if let Some(notice) = playback_notice.as_ref() {
                 format!(
-                    "[↑/↓] Select | [ENTER] Open / Play | [N] Normalize | [R] Refresh | [Q] Quit | {notice}"
+                    "[↑/↓] Select | [ENTER] Open / Play | [[]/]] Pause: {}s | [N] Normalize | [R] Refresh | [Q] Quit | {notice}",
+                    silence_secs
                 )
             } else {
-                " [↑/↓] Select  |  [ENTER] Open / Play  |  [N] Normalize  |  [R] Refresh  |  [Q] Quit".to_string()
+                format!(
+                    " [↑/↓] Select  |  [ENTER] Open / Play  |  [[]/]] Pause: {}s  |  [N] Normalize  |  [R] Refresh  |  [Q] Quit",
+                    silence_secs
+                )
             };
             let status = Paragraph::new(status_text)
                 .block(Block::default().borders(Borders::ALL).title(" Controls "));
-            f.render_widget(status, chunks[1]);
+            f.render_widget(status, chunks[2]);
 
             if let Some(modal) = normalization.as_ref() {
                 draw_normalization_modal(f, modal);
@@ -285,8 +330,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 KeyCode::Char('q' | 'Q') => break,
                 KeyCode::Char('r' | 'R') => {
                     entries = scan_dir(&current_dir);
+                    load_durations(&entries, &duration_sender);
                     list_state.select(if entries.is_empty() { None } else { Some(0) });
                 }
+                KeyCode::Char('[') => silence_secs = silence_secs.saturating_sub(1),
+                KeyCode::Char(']') => silence_secs = silence_secs.saturating_add(1),
                 KeyCode::Char('n' | 'N') => {
                     normalization = Some(start_scan(&entries));
                 }
@@ -310,6 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if entry.is_dir {
                                 current_dir = entry.path.clone();
                                 entries = scan_dir(&current_dir);
+                                load_durations(&entries, &duration_sender);
                                 list_state.select(if entries.is_empty() { None } else { Some(0) });
                             } else if !matches!(entry.side, TrackSide::Unmatched) {
                                 let entries_clone = entries.clone();
@@ -321,7 +370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let result = audio::play_sequence_from(
                                         &entries_clone,
                                         selected,
-                                        2,
+                                        silence_secs,
                                         &worker_cancelled,
                                     );
                                     let _ = sender.send(result);
@@ -345,6 +394,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+fn load_durations(entries: &[FileEntry], sender: &mpsc::Sender<DurationMessage>) {
+    for entry in entries
+        .iter()
+        .filter(|entry| !entry.is_dir && !matches!(entry.side, TrackSide::Unmatched))
+    {
+        let path = entry.path.clone();
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let duration = audio::track_duration(&path).ok();
+            let _ = sender.send(DurationMessage::Loaded { path, duration });
+        });
+    }
+}
+
+fn format_duration(duration: Option<Duration>) -> String {
+    let Some(duration) = duration else {
+        return "--:--".to_string();
+    };
+    let total_secs = duration.as_secs();
+    format!("{}:{:02}", total_secs / 60, total_secs % 60)
+}
+
+fn side_totals(
+    entries: &[FileEntry],
+    durations: &HashMap<PathBuf, Option<Duration>>,
+    silence_secs: u64,
+) -> (Option<Duration>, Option<Duration>) {
+    fn total_for_side(
+        entries: &[FileEntry],
+        durations: &HashMap<PathBuf, Option<Duration>>,
+        is_side_a: bool,
+        silence_secs: u64,
+    ) -> Option<Duration> {
+        let tracks: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    (&entry.side, is_side_a),
+                    (TrackSide::SideA(_), true) | (TrackSide::SideB(_), false)
+                )
+            })
+            .collect();
+        let mut total = Duration::ZERO;
+        for entry in &tracks {
+            total = total.checked_add((*durations.get(&entry.path)?)?)?;
+        }
+        total.checked_add(Duration::from_secs(
+            silence_secs.saturating_mul(tracks.len().saturating_sub(1) as u64),
+        ))
+    }
+
+    (
+        total_for_side(entries, durations, true, silence_secs),
+        total_for_side(entries, durations, false, silence_secs),
+    )
 }
 
 fn start_scan(entries: &[FileEntry]) -> NormalizeModal {
@@ -479,10 +585,35 @@ fn draw_normalization_modal(frame: &mut Frame, modal: &NormalizeModal) {
             frame.render_widget(paragraph, area);
         }
         ModalPhase::Reviewing => {
+            let constraints = if modal.errors.is_empty() {
+                vec![Constraint::Min(3), Constraint::Length(3)]
+            } else {
+                vec![
+                    Constraint::Percentage(40),
+                    Constraint::Min(3),
+                    Constraint::Length(3),
+                ]
+            };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(3)])
+                .constraints(constraints)
                 .split(area);
+
+            let list_area = if modal.errors.is_empty() {
+                chunks[0]
+            } else {
+                let error_text = modal.errors.join("\n");
+                let errors = Paragraph::new(error_text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(" Scan errors ({}) ", modal.errors.len())),
+                    )
+                    .style(Style::default().fg(Color::Red))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(errors, chunks[0]);
+                chunks[1]
+            };
             let items: Vec<ListItem> = modal
                 .candidates
                 .iter()
@@ -513,7 +644,7 @@ fn draw_normalization_modal(frame: &mut Frame, modal: &NormalizeModal) {
             if !modal.candidates.is_empty() {
                 list_state.select(Some(modal.selected));
             }
-            frame.render_stateful_widget(list, chunks[0], &mut list_state);
+            frame.render_stateful_widget(list, list_area, &mut list_state);
 
             let footer = if modal.candidates.is_empty() {
                 format!(
