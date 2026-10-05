@@ -85,7 +85,13 @@ fn run_ffmpeg(command: &mut Command, cancelled: &AtomicBool) -> Result<Output, S
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Could not start FFmpeg: {error}"))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "Could not start FFmpeg: the `ffmpeg` executable was not found in PATH. Install FFmpeg and make sure `ffmpeg` is available from the terminal.".to_string()
+            } else {
+                format!("Could not start FFmpeg: {error}")
+            }
+        })?;
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
