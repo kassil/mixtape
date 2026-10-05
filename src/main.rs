@@ -185,7 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(
-                    [Constraint::Min(3), Constraint::Length(2), Constraint::Length(3)].as_ref(),
+                    [Constraint::Min(3), Constraint::Length(3), Constraint::Length(3)].as_ref(),
                 )
                 .split(f.area());
 

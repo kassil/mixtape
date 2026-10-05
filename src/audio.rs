@@ -2,18 +2,35 @@ use crate::track::FileEntry;
 use rodio::{Decoder, OutputStream, Sink, Source};
 use std::fs::File;
 use std::io::BufReader;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const DEFAULT_SILENCE_SECS: u64 = 2;
 
 pub fn track_duration(path: &std::path::Path) -> Result<Duration, String> {
-    let file = File::open(path).map_err(|error| format!("Could not open track: {error}"))?;
-    let decoder = Decoder::new(BufReader::new(file))
-        .map_err(|error| format!("Could not read track metadata: {error}"))?;
-    decoder
-        .total_duration()
-        .ok_or_else(|| "Track duration is unavailable".to_string())
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-i"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Could not start FFmpeg: {error}"))?;
+    parse_duration(&String::from_utf8_lossy(&output.stderr))
+        .ok_or_else(|| "FFmpeg did not report a track duration".to_string())
+}
+
+fn parse_duration(output: &str) -> Option<Duration> {
+    let duration = output.lines().find_map(|line| {
+        let (_, value) = line.split_once("Duration:")?;
+        Some(value.split(',').next()?.trim())
+    })?;
+    let mut parts = duration.split(':');
+    let hours: u64 = parts.next()?.parse().ok()?;
+    let minutes: u64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds).ok()
 }
 
 pub fn play_sequence_from(
@@ -82,4 +99,26 @@ pub fn play_sequence_from(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_ffmpeg_duration_with_fractional_seconds() {
+        assert_eq!(
+            parse_duration(
+                "Input #0, ogg, from 'track.ogg':\n  Duration: 01:02:03.50, start: 0.000000"
+            ),
+            Some(Duration::from_millis(3_723_500))
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_or_malformed_durations() {
+        assert_eq!(parse_duration("Duration: N/A, start: 0.000000"), None);
+        assert_eq!(parse_duration("Duration: 1:2, start: 0.000000"), None);
+    }
 }
