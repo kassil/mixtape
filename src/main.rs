@@ -328,16 +328,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match key.code {
                 KeyCode::Char('q' | 'Q') => break,
+                // Refresh the directory listing
                 KeyCode::Char('r' | 'R') => {
                     entries = scan_dir(&current_dir);
                     load_durations(&entries, &duration_sender);
                     list_state.select(if entries.is_empty() { None } else { Some(0) });
                 }
+                // Adjust silence duration
                 KeyCode::Char('[') => silence_secs = silence_secs.saturating_sub(1),
                 KeyCode::Char(']') => silence_secs = silence_secs.saturating_add(1),
+                // Start normalization scan
+                // TODO Maybe scan should start from the cursor
                 KeyCode::Char('n' | 'N') => {
                     normalization = Some(start_scan(&entries));
                 }
+                // Navigate through the list of entries
                 KeyCode::Down => {
                     if let Some(selected) = list_state.selected() {
                         if selected + 1 < entries.len() {
@@ -352,15 +357,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // Enter key: navigate into directories or play selected track
                 KeyCode::Enter => {
                     if let Some(selected) = list_state.selected() {
                         if let Some(entry) = entries.get(selected) {
                             if entry.is_dir {
+                                // Navigate into the selected directory
                                 current_dir = entry.path.clone();
                                 entries = scan_dir(&current_dir);
                                 load_durations(&entries, &duration_sender);
                                 list_state.select(if entries.is_empty() { None } else { Some(0) });
                             } else if !matches!(entry.side, TrackSide::Unmatched) {
+                                // Play the sequence starting from the selected track
                                 let entries_clone = entries.clone();
                                 let track_name = entry.name.clone();
                                 let cancelled = Arc::new(AtomicBool::new(false));

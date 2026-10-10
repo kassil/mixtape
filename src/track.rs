@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub enum TrackSide {
     SideA(u32),
     SideB(u32),
+    // File that does not follow the track naming convention or directory
     Unmatched,
 }
 
@@ -38,6 +39,7 @@ pub fn scan_dir(current_dir: &Path) -> Vec<FileEntry> {
     let mut entries = Vec::new();
 
     if let Some(parent) = current_dir.parent().filter(|parent| *parent != current_dir) {
+        // Add an entry for the parent directory ("..") to allow navigating up in the directory tree.
         entries.push(FileEntry {
             name: "..".to_string(),
             path: parent.to_path_buf(),
@@ -52,6 +54,7 @@ pub fn scan_dir(current_dir: &Path) -> Vec<FileEntry> {
             if path.is_file() || path.is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let is_dir = path.is_dir();
+                // Audio file extension check
                 let supported_audio = path
                     .extension()
                     .and_then(|extension| extension.to_str())
@@ -59,6 +62,7 @@ pub fn scan_dir(current_dir: &Path) -> Vec<FileEntry> {
                         extension.eq_ignore_ascii_case("ogg")
                             || extension.eq_ignore_ascii_case("mp3")
                     });
+                // Determine the side and sequence number for the track based on the filename
                 let side = if !is_dir && supported_audio {
                     if let Some(caps) = re.captures(&name) {
                         let side_char = caps[1].to_uppercase();
@@ -86,13 +90,19 @@ pub fn scan_dir(current_dir: &Path) -> Vec<FileEntry> {
     }
 
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        // Both are directories
         (true, true) => match (a.name == "..", b.name == "..") {
+            // Parent dir appears first
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
+            // Sort dirs alphabetically ignoring case
             _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         },
+        // Directories come before files
         (true, false) => std::cmp::Ordering::Less,
+        // Files come after directories
         (false, true) => std::cmp::Ordering::Greater,
+        // Both are files: sort by side and sequence number
         (false, false) => match (&a.side, &b.side) {
             (TrackSide::SideA(a_num), TrackSide::SideA(b_num))
             | (TrackSide::SideB(a_num), TrackSide::SideB(b_num)) => a_num.cmp(b_num),

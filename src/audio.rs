@@ -42,17 +42,18 @@ pub fn play_sequence_from(
     let Some(starting_entry) = entries.get(start_index) else {
         return Err("No track selected".to_string());
     };
+    // We play to the end of the current side
     let target_side = match &starting_entry.side {
         crate::track::TrackSide::SideA(_) => crate::track::TrackSide::SideA(0),
         crate::track::TrackSide::SideB(_) => crate::track::TrackSide::SideB(0),
         _ => return Err("Selected entry is not a side track".to_string()),
     };
-
+    // Set up the audio output and player
     let (_stream, handle) = OutputStream::try_default()
         .map_err(|error| format!("Could not open audio output: {error}"))?;
     let sink =
         Sink::try_new(&handle).map_err(|error| format!("Could not create player: {error}"))?;
-
+    // Collect the remaining tracks on the same side starting from the selected track
     let remaining: Vec<_> = entries
         .iter()
         .enumerate()
@@ -63,6 +64,7 @@ pub fn play_sequence_from(
         })
         .collect();
 
+    // Prepare the playable tracks
     let mut playable_tracks = Vec::new();
     for (_, track) in remaining {
         if cancelled.load(Ordering::Relaxed) {
@@ -77,6 +79,7 @@ pub fn play_sequence_from(
 
     let playable_count = playable_tracks.len();
     for (index, decoder) in playable_tracks.into_iter().enumerate() {
+        // TODO Why check cancelled twice?
         if cancelled.load(Ordering::Relaxed) {
             sink.stop();
             return Ok(());
@@ -84,6 +87,9 @@ pub fn play_sequence_from(
         sink.append(decoder.buffered());
 
         if index + 1 < playable_count {
+            // Silence between tracks
+            //TODO Is it wise to assume a sample rate of 44100 Hz for the silence?
+            //TODO Should we reuse the same silence source for all gaps?
             let silence = rodio::source::Zero::<i16>::new(1, 44100)
                 .take_duration(Duration::from_secs(silence_secs));
             sink.append(silence);
@@ -91,6 +97,7 @@ pub fn play_sequence_from(
     }
 
     while !sink.empty() {
+        // TODO Why check cancelled twice?
         if cancelled.load(Ordering::Relaxed) {
             sink.stop();
             break;
