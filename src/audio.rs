@@ -1,4 +1,5 @@
 use crate::track::FileEntry;
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, OutputStream, Sink, Source};
 use std::fs::File;
 use std::io::BufReader;
@@ -70,8 +71,7 @@ pub fn play_sequence_from(
         _ => return Err("Selected entry is not a side track".to_string()),
     };
     // Set up the audio output and player
-    let (_stream, handle) = OutputStream::try_default()
-        .map_err(|error| format!("Could not open audio output: {error}"))?;
+    let (_stream, handle, sample_rate) = open_output_stream()?;
     let sink = Arc::new(
         Sink::try_new(&handle).map_err(|error| format!("Could not create player: {error}"))?,
     );
@@ -81,15 +81,60 @@ pub fn play_sequence_from(
         !entry.is_dir && std::mem::discriminant(&entry.side) == std::mem::discriminant(&target_side)
     });
 
-    let result = play_tracks(&sink, &mut remaining, silence_secs, control, status_sender);
+    let result = play_tracks(
+        &sink,
+        &mut remaining,
+        silence_secs,
+        sample_rate,
+        control,
+        status_sender,
+    );
     control.sink.lock().unwrap().take();
     result
+}
+
+fn open_output_stream() -> Result<(OutputStream, rodio::OutputStreamHandle, u32), String> {
+    let host = rodio::cpal::default_host();
+    let mut last_error = None;
+
+    if let Some(device) = host.default_output_device() {
+        match open_output_device(&device) {
+            Ok(output) => return Ok(output),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let devices = host.output_devices().map_err(|error| {
+        last_error
+            .clone()
+            .unwrap_or_else(|| format!("Could not enumerate audio output devices: {error}"))
+    })?;
+    for device in devices {
+        if let Ok(output) = open_output_device(&device) {
+            return Ok(output);
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "Could not find an audio output device".to_string()))
+}
+
+fn open_output_device(
+    device: &rodio::cpal::Device,
+) -> Result<(OutputStream, rodio::OutputStreamHandle, u32), String> {
+    let output_config = device
+        .default_output_config()
+        .map_err(|error| format!("Could not read audio output configuration: {error}"))?;
+    let sample_rate = output_config.sample_rate().0;
+    let (stream, handle) = OutputStream::try_from_device_config(device, output_config)
+        .map_err(|error| format!("Could not open audio output: {error}"))?;
+    Ok((stream, handle, sample_rate))
 }
 
 fn play_tracks<'a>(
     sink: &Sink,
     remaining: &mut impl Iterator<Item = &'a FileEntry>,
     silence_secs: u64,
+    sample_rate: u32,
     control: &PlaybackControl,
     status_sender: &Sender<String>,
 ) -> Result<(), String> {
@@ -99,20 +144,21 @@ fn play_tracks<'a>(
     };
 
     loop {
-        if control.is_cancelled() {
-            sink.stop();
+        // Queue the current track
+        if !queue_source(
+            sink,
+            format!("Playing {current_name}"),
+            control,
+            status_sender,
+            |sink| sink.append(decoder),
+        ) {
+            // User cancelled before the track could be queued
             return Ok(());
         }
 
-        let _ = status_sender.send(format!("Playing {current_name}"));
-        sink.append(decoder);
         let next = next_playable_track(remaining, control);
-        // This thread waits while UI thread continues to handles keystrokes.
-        sink.sleep_until_end();
-
-        if control.is_cancelled() {
-            // Woken after UI thread stopped the sink
-            sink.stop();
+        if !wait_for_source(sink, control) {
+            // User stopped playback
             return Ok(());
         }
 
@@ -121,18 +167,18 @@ fn play_tracks<'a>(
             break;
         };
 
-        // Announce the upcoming track
-        let _ = status_sender.send(format!("Upcoming: {next_name}"));
-        // Silence between tracks
-        //TODO Is it wise to assume a sample rate of 44100 Hz for the silence?
-        //TODO Should we reuse the same silence source for all gaps?
-        let silence = rodio::source::Zero::<i16>::new(1, 44100)
+        // Insert a period of silence before the next track
+        let silence = rodio::source::Zero::<i16>::new(1, sample_rate)
             .take_duration(Duration::from_secs(silence_secs));
-        sink.append(silence);
-        sink.sleep_until_end();
-
-        if control.is_cancelled() {
-            sink.stop();
+        if !queue_source(
+            sink,
+            format!("Upcoming: {next_name}"),
+            control,
+            status_sender,
+            |sink| sink.append(silence),
+        ) || !wait_for_source(sink, control)
+        {
+            // User cancelled before the silence could be queued?
             return Ok(());
         }
 
@@ -141,6 +187,38 @@ fn play_tracks<'a>(
     }
 
     Ok(())
+}
+
+// Queue a track or silence and update the UI status.
+fn queue_source(
+    sink: &Sink,
+    status: String,
+    control: &PlaybackControl,
+    status_sender: &Sender<String>,
+    append: impl FnOnce(&Sink),
+) -> bool {
+    if control.is_cancelled() {
+        sink.stop();
+        return false;
+    }
+
+    // Send the status update to the UI
+    let _ = status_sender.send(status);
+    // Queue the next track or silence
+    append(sink);
+
+    true
+}
+
+fn wait_for_source(sink: &Sink, control: &PlaybackControl) -> bool {
+    sink.sleep_until_end();
+
+    if control.is_cancelled() {
+        sink.stop();
+        false
+    } else {
+        true
+    }
 }
 
 fn next_playable_track<'a>(
