@@ -85,10 +85,11 @@ struct NormalizeModal {
 }
 
 struct PlaybackState {
-    description: String,
-    cancelled: Arc<AtomicBool>,
+    status: String,
+    control: Arc<audio::PlaybackControl>,
     stopping: bool,
     receiver: Receiver<Result<(), String>>,
+    status_receiver: Receiver<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -116,6 +117,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         while let Ok(DurationMessage::Loaded { path, duration }) = duration_receiver.try_recv() {
             durations.insert(path, duration);
+        }
+
+        if let Some(active) = playback.as_mut() {
+            while let Ok(status) = active.status_receiver.try_recv() {
+                active.status = status;
+            }
         }
 
         let playback_result = playback
@@ -241,11 +248,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let status_text = if let Some(active) = playback.as_ref() {
                 if active.stopping {
-                    format!("Stopping {}...", active.description)
+                    format!("Stopping {}...", active.status)
                 } else {
                     format!(
-                        "Playing {} | [S] Stop | Sequence locked | [Q] Stop and Quit",
-                        active.description
+                        "{} | [S] Stop | Sequence locked | [Q] Stop and Quit",
+                        active.status
                     )
                 }
             } else if let Some(notice) = playback_notice.as_ref() {
@@ -314,11 +321,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match key.code {
                     KeyCode::Char('s' | 'S') => {
                         active.stopping = true;
-                        active.cancelled.store(true, Ordering::Relaxed);
+                        active.control.stop();
                     }
                     KeyCode::Char('q' | 'Q') => {
                         active.stopping = true;
-                        active.cancelled.store(true, Ordering::Relaxed);
+                        active.control.stop();
                         quit_after_playback = true;
                     }
                     _ => {}
@@ -371,24 +378,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Play the sequence starting from the selected track
                                 let entries_clone = entries.clone();
                                 let track_name = entry.name.clone();
-                                let cancelled = Arc::new(AtomicBool::new(false));
-                                let worker_cancelled = Arc::clone(&cancelled);
+                                let control = Arc::new(audio::PlaybackControl::default());
+                                let worker_control = Arc::clone(&control);
                                 let (sender, receiver) = mpsc::channel();
+                                let (status_sender, status_receiver) = mpsc::channel();
                                 thread::spawn(move || {
                                     let result = audio::play_sequence_from(
                                         &entries_clone,
                                         selected,
                                         silence_secs,
-                                        &worker_cancelled,
+                                        &worker_control,
+                                        &status_sender,
                                     );
                                     let _ = sender.send(result);
                                 });
                                 playback_notice = None;
                                 playback = Some(PlaybackState {
-                                    description: track_name,
-                                    cancelled,
+                                    status: format!("Starting {track_name}"),
+                                    control,
                                     stopping: false,
                                     receiver,
+                                    status_receiver,
                                 });
                             }
                         }

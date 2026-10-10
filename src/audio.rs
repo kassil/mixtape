@@ -4,9 +4,29 @@ use std::fs::File;
 use std::io::BufReader;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc::Sender, Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_SILENCE_SECS: u64 = 2;
+
+#[derive(Default)]
+pub struct PlaybackControl {
+    cancelled: AtomicBool,
+    sink: Mutex<Option<Arc<Sink>>>,
+}
+
+impl PlaybackControl {
+    pub fn stop(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        if let Some(sink) = self.sink.lock().unwrap().as_ref() {
+            sink.stop();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
 
 pub fn track_duration(path: &std::path::Path) -> Result<Duration, String> {
     let output = Command::new("ffmpeg")
@@ -37,7 +57,8 @@ pub fn play_sequence_from(
     entries: &[FileEntry],
     start_index: usize,
     silence_secs: u64,
-    cancelled: &AtomicBool,
+    control: &PlaybackControl,
+    status_sender: &Sender<String>,
 ) -> Result<(), String> {
     let Some(starting_entry) = entries.get(start_index) else {
         return Err("No track selected".to_string());
@@ -51,61 +72,95 @@ pub fn play_sequence_from(
     // Set up the audio output and player
     let (_stream, handle) = OutputStream::try_default()
         .map_err(|error| format!("Could not open audio output: {error}"))?;
-    let sink =
-        Sink::try_new(&handle).map_err(|error| format!("Could not create player: {error}"))?;
+    let sink = Arc::new(
+        Sink::try_new(&handle).map_err(|error| format!("Could not create player: {error}"))?,
+    );
+    *control.sink.lock().unwrap() = Some(Arc::clone(&sink));
     // Collect the remaining tracks on the same side starting from the selected track
-    let remaining: Vec<_> = entries
-        .iter()
-        .enumerate()
-        .skip(start_index)
-        .filter(|(_, entry)| {
-            !entry.is_dir
-                && std::mem::discriminant(&entry.side) == std::mem::discriminant(&target_side)
-        })
-        .collect();
+    let mut remaining = entries.iter().skip(start_index).filter(|entry| {
+        !entry.is_dir && std::mem::discriminant(&entry.side) == std::mem::discriminant(&target_side)
+    });
 
-    // Prepare the playable tracks
-    let mut playable_tracks = Vec::new();
-    for (_, track) in remaining {
-        if cancelled.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if let Ok(file) = File::open(&track.path) {
-            if let Ok(decoder) = Decoder::new(BufReader::new(file)) {
-                playable_tracks.push(decoder);
-            }
-        }
-    }
+    let result = play_tracks(&sink, &mut remaining, silence_secs, control, status_sender);
+    control.sink.lock().unwrap().take();
+    result
+}
 
-    let playable_count = playable_tracks.len();
-    for (index, decoder) in playable_tracks.into_iter().enumerate() {
-        // TODO Why check cancelled twice?
-        if cancelled.load(Ordering::Relaxed) {
+fn play_tracks<'a>(
+    sink: &Sink,
+    remaining: &mut impl Iterator<Item = &'a FileEntry>,
+    silence_secs: u64,
+    control: &PlaybackControl,
+    status_sender: &Sender<String>,
+) -> Result<(), String> {
+    // Get the first playable track from the iterator
+    let Some((mut current_name, mut decoder)) = next_playable_track(remaining, control) else {
+        return Ok(());
+    };
+
+    loop {
+        if control.is_cancelled() {
             sink.stop();
             return Ok(());
         }
-        sink.append(decoder.buffered());
 
-        if index + 1 < playable_count {
-            // Silence between tracks
-            //TODO Is it wise to assume a sample rate of 44100 Hz for the silence?
-            //TODO Should we reuse the same silence source for all gaps?
-            let silence = rodio::source::Zero::<i16>::new(1, 44100)
-                .take_duration(Duration::from_secs(silence_secs));
-            sink.append(silence);
-        }
-    }
+        let _ = status_sender.send(format!("Playing {current_name}"));
+        sink.append(decoder);
+        let next = next_playable_track(remaining, control);
+        // This thread waits while UI thread continues to handles keystrokes.
+        sink.sleep_until_end();
 
-    while !sink.empty() {
-        // TODO Why check cancelled twice?
-        if cancelled.load(Ordering::Relaxed) {
+        if control.is_cancelled() {
+            // Woken after UI thread stopped the sink
             sink.stop();
+            return Ok(());
+        }
+
+        // Check if there is a next track to play
+        let Some((next_name, next_decoder)) = next else {
             break;
+        };
+
+        // Announce the upcoming track
+        let _ = status_sender.send(format!("Upcoming: {next_name}"));
+        // Silence between tracks
+        //TODO Is it wise to assume a sample rate of 44100 Hz for the silence?
+        //TODO Should we reuse the same silence source for all gaps?
+        let silence = rodio::source::Zero::<i16>::new(1, 44100)
+            .take_duration(Duration::from_secs(silence_secs));
+        sink.append(silence);
+        sink.sleep_until_end();
+
+        if control.is_cancelled() {
+            sink.stop();
+            return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(20));
+
+        current_name = next_name;
+        decoder = next_decoder;
     }
 
     Ok(())
+}
+
+fn next_playable_track<'a>(
+    remaining: &mut impl Iterator<Item = &'a FileEntry>,
+    control: &PlaybackControl,
+) -> Option<(String, Decoder<BufReader<File>>)> {
+    for track in remaining {
+        if control.is_cancelled() {
+            return None;
+        }
+        let Ok(file) = File::open(&track.path) else {
+            // Failed to open the file, skip to the next track
+            continue;
+        };
+        if let Ok(decoder) = Decoder::new(BufReader::new(file)) {
+            // Created a decoder for the track
+            return Some((track.name.clone(), decoder));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
