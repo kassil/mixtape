@@ -115,6 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut silence_secs = audio::DEFAULT_SILENCE_SECS;
 
     loop {
+        // Process any incoming duration messages from the audio subsystem
         while let Ok(DurationMessage::Loaded { path, duration }) = duration_receiver.try_recv() {
             durations.insert(path, duration);
         }

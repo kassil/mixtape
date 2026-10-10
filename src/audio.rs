@@ -30,6 +30,9 @@ impl PlaybackControl {
 }
 
 pub fn track_duration(path: &std::path::Path) -> Result<Duration, String> {
+    // Reasons why we don't internally calculate duration:
+    // - Ogg/Vorbis has no duration available when the decoder opens; Symphonia only learns the frame count at the stream’s final page.
+    // - For a generated 1-second MP3, Rodio 0.19 reported 5.294967295s. Its Symphonia duration conversion appears to mishandle fractional seconds.
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-nostdin", "-i"])
         .arg(path)
@@ -130,6 +133,9 @@ fn open_output_device(
     Ok((stream, handle, sample_rate))
 }
 
+// Play the remaining tracks in the iterator. Insert periods of silence between
+// tracks. Return Ok(()) if playback completes or is cancelled, Err(String) if
+// an error occurs.
 fn play_tracks<'a>(
     sink: &Sink,
     remaining: &mut impl Iterator<Item = &'a FileEntry>,
@@ -210,6 +216,7 @@ fn queue_source(
     true
 }
 
+// Wait for the current source (track or silence) to finish playing. Returns false if playback was cancelled.
 fn wait_for_source(sink: &Sink, control: &PlaybackControl) -> bool {
     sink.sleep_until_end();
 
@@ -221,6 +228,9 @@ fn wait_for_source(sink: &Sink, control: &PlaybackControl) -> bool {
     }
 }
 
+// Get the next playable track from the remaining iterator.  Skip any tracks
+// that cannot be opened or decoded. Return None if playback was cancelled or
+// no playable tracks remain.
 fn next_playable_track<'a>(
     remaining: &mut impl Iterator<Item = &'a FileEntry>,
     control: &PlaybackControl,
