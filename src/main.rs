@@ -37,13 +37,13 @@ enum DurationMessage {
 
 struct Candidate {
     entry: FileEntry,
-    peak_db: f32,
+    report: Option<loudness::TrackReport>,
     state: CandidateState,
 }
 
 enum CandidateState {
     Pending,
-    Normalized,
+    Processed,
     Failed(String),
 }
 
@@ -51,11 +51,11 @@ enum CandidateState {
 enum ModalPhase {
     Scanning,
     Reviewing,
-    Normalizing,
+    Processing,
     Cancelling,
 }
 
-enum NormalizeMessage {
+enum SidePrepMessage {
     ScanProgress {
         index: usize,
         total: usize,
@@ -66,13 +66,14 @@ enum NormalizeMessage {
         errors: Vec<String>,
     },
     ScanCancelled,
-    NormalizeComplete {
+    ProcessComplete {
         index: usize,
+        report: Option<loudness::TrackReport>,
         result: Result<(), String>,
     },
 }
 
-struct NormalizeModal {
+struct SidePrepModal {
     phase: ModalPhase,
     current: String,
     completed: usize,
@@ -81,7 +82,7 @@ struct NormalizeModal {
     errors: Vec<String>,
     selected: usize,
     cancelled: Arc<AtomicBool>,
-    receiver: Receiver<NormalizeMessage>,
+    receiver: Receiver<SidePrepMessage>,
 }
 
 struct PlaybackState {
@@ -108,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !entries.is_empty() {
         list_state.select(Some(0));
     }
-    let mut normalization: Option<NormalizeModal> = None;
+    let mut side_prep: Option<SidePrepModal> = None;
     let mut playback: Option<PlaybackState> = None;
     let mut playback_notice: Option<String> = None;
     let mut quit_after_playback = false;
@@ -143,18 +144,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        let mut close_normalization = false;
-        if let Some(modal) = normalization.as_mut() {
+        let mut close_side_prep = false;
+        if let Some(modal) = side_prep.as_mut() {
             while let Ok(message) = modal.receiver.try_recv() {
                 match message {
-                    NormalizeMessage::ScanProgress { index, total, name } => {
+                    SidePrepMessage::ScanProgress { index, total, name } => {
                         modal.completed = index;
                         modal.total = total;
                         modal.current = name;
                     }
-                    NormalizeMessage::ScanComplete { candidates, errors } => {
+                    SidePrepMessage::ScanComplete { candidates, errors } => {
                         if modal.phase == ModalPhase::Cancelling {
-                            close_normalization = true;
+                            close_side_prep = true;
                         } else {
                             modal.candidates = candidates;
                             modal.errors = errors;
@@ -163,18 +164,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             modal.selected = 0;
                         }
                     }
-                    NormalizeMessage::ScanCancelled => {
-                        close_normalization = true;
+                    SidePrepMessage::ScanCancelled => {
+                        close_side_prep = true;
                     }
-                    NormalizeMessage::NormalizeComplete { index, result } => {
+                    SidePrepMessage::ProcessComplete {
+                        index,
+                        report,
+                        result,
+                    } => {
                         if modal.phase == ModalPhase::Cancelling
                             || matches!(&result, Err(error) if error == "Cancelled")
                         {
-                            close_normalization = true;
+                            close_side_prep = true;
                         } else {
                             if let Some(candidate) = modal.candidates.get_mut(index) {
                                 candidate.state = match result {
-                                    Ok(()) => CandidateState::Normalized,
+                                    Ok(()) => {
+                                        candidate.report = report;
+                                        CandidateState::Processed
+                                    }
                                     Err(error) => CandidateState::Failed(error),
                                 };
                             }
@@ -185,8 +193,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        if close_normalization {
-            normalization = None;
+        if close_side_prep {
+            side_prep = None;
         }
 
         terminal.draw(|f| {
@@ -258,12 +266,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else if let Some(notice) = playback_notice.as_ref() {
                 format!(
-                    "[↑/↓] Select | [ENTER] Open / Play | [[]/]] Pause: {}s | [N] Normalize | [R] Refresh | [Q] Quit | {notice}",
+                    "[↑/↓] Select | [ENTER] Open / Play | [[]/]] Pause: {}s | [N] Side Prep | [R] Refresh | [Q] Quit | {notice}",
                     silence_secs
                 )
             } else {
                 format!(
-                    " [↑/↓] Select  |  [ENTER] Open / Play  |  [[]/]] Pause: {}s  |  [N] Normalize  |  [R] Refresh  |  [Q] Quit",
+                    " [↑/↓] Select  |  [ENTER] Open / Play  |  [[]/]] Pause: {}s  |  [N] Side Prep  |  [R] Refresh  |  [Q] Quit",
                     silence_secs
                 )
             };
@@ -271,8 +279,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .block(Block::default().borders(Borders::ALL).title(" Controls "));
             f.render_widget(status, chunks[2]);
 
-            if let Some(modal) = normalization.as_ref() {
-                draw_normalization_modal(f, modal);
+            if let Some(modal) = side_prep.as_ref() {
+                draw_side_prep_modal(f, modal);
             }
         })?;
 
@@ -281,11 +289,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Event::Key(key) = event::read()? {
-            if let Some(modal) = normalization.as_mut() {
+            if let Some(modal) = side_prep.as_mut() {
                 match key.code {
                     KeyCode::Esc => {
                         if modal.phase == ModalPhase::Reviewing {
-                            normalization = None;
+                            side_prep = None;
                         } else if modal.phase != ModalPhase::Cancelling {
                             modal.cancelled.store(true, Ordering::Relaxed);
                             modal.phase = ModalPhase::Cancelling;
@@ -307,10 +315,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .candidates
                             .get(modal.selected)
                             .is_some_and(|candidate| {
-                                !matches!(candidate.state, CandidateState::Normalized)
+                                !matches!(candidate.state, CandidateState::Processed)
                             })
                         {
-                            start_normalization(modal);
+                            start_processing(modal);
                         }
                     }
                     _ => {}
@@ -345,10 +353,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Adjust silence duration
                 KeyCode::Char('[') => silence_secs = silence_secs.saturating_sub(1),
                 KeyCode::Char(']') => silence_secs = silence_secs.saturating_add(1),
-                // Start normalization scan
-                // TODO Maybe scan should start from the cursor
+                // Scan the selected track through the end of its side.
                 KeyCode::Char('n' | 'N') => {
-                    normalization = Some(start_scan(&entries));
+                    if let Some(selected) = list_state.selected() {
+                        if entries.get(selected).is_some_and(|entry| {
+                            !entry.is_dir
+                                && matches!(&entry.side, TrackSide::SideA(_) | TrackSide::SideB(_))
+                        }) {
+                            side_prep = Some(start_side_prep(&entries, selected));
+                        } else {
+                            playback_notice = Some(
+                                "Select a Side A or Side B track to start Side Prep".to_string(),
+                            );
+                        }
+                    }
                 }
                 // Navigate through the list of entries
                 KeyCode::Down => {
@@ -472,12 +490,8 @@ fn side_totals(
     )
 }
 
-fn start_scan(entries: &[FileEntry]) -> NormalizeModal {
-    let tracks: Vec<FileEntry> = entries
-        .iter()
-        .filter(|entry| !entry.is_dir && !matches!(entry.side, TrackSide::Unmatched))
-        .cloned()
-        .collect();
+fn start_side_prep(entries: &[FileEntry], start_index: usize) -> SidePrepModal {
+    let tracks = track::side_sequence_from(entries, start_index);
     let total = tracks.len();
     let (sender, receiver) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -489,11 +503,11 @@ fn start_scan(entries: &[FileEntry]) -> NormalizeModal {
 
         for (index, entry) in tracks.into_iter().enumerate() {
             if worker_cancelled.load(Ordering::Relaxed) {
-                let _ = sender.send(NormalizeMessage::ScanCancelled);
+                let _ = sender.send(SidePrepMessage::ScanCancelled);
                 return;
             }
             if sender
-                .send(NormalizeMessage::ScanProgress {
+                .send(SidePrepMessage::ScanProgress {
                     index,
                     total,
                     name: entry.name.clone(),
@@ -503,29 +517,31 @@ fn start_scan(entries: &[FileEntry]) -> NormalizeModal {
                 return;
             }
 
-            match loudness::scan_peak_db(&entry.path, &worker_cancelled) {
-                Ok(peak_db) if loudness::peak_needs_normalizing(peak_db) => {
-                    candidates.push(Candidate {
-                        entry,
-                        peak_db,
-                        state: CandidateState::Pending,
-                    });
-                }
-                Ok(_) => {}
+            match loudness::scan_track(&entry.path, &worker_cancelled) {
+                Ok(report) => candidates.push(Candidate {
+                    entry,
+                    report: Some(report),
+                    state: CandidateState::Pending,
+                }),
                 Err(error) if error != "Cancelled" => {
                     errors.push(format!("{}: {error}", entry.name));
+                    candidates.push(Candidate {
+                        entry,
+                        report: None,
+                        state: CandidateState::Failed(error),
+                    });
                 }
                 Err(_) => {
-                    let _ = sender.send(NormalizeMessage::ScanCancelled);
+                    let _ = sender.send(SidePrepMessage::ScanCancelled);
                     return;
                 }
             }
         }
 
-        let _ = sender.send(NormalizeMessage::ScanComplete { candidates, errors });
+        let _ = sender.send(SidePrepMessage::ScanComplete { candidates, errors });
     });
 
-    NormalizeModal {
+    SidePrepModal {
         phase: ModalPhase::Scanning,
         current: "Starting scan".to_string(),
         completed: 0,
@@ -538,24 +554,40 @@ fn start_scan(entries: &[FileEntry]) -> NormalizeModal {
     }
 }
 
-fn start_normalization(modal: &mut NormalizeModal) {
+fn start_processing(modal: &mut SidePrepModal) {
     let index = modal.selected;
-    let candidate = &modal.candidates[index];
+    let Some(candidate) = modal.candidates.get(index) else {
+        return;
+    };
+    let Some(report) = candidate.report.clone() else {
+        return;
+    };
+    if !report.needs_processing() {
+        return;
+    }
     let path = candidate.entry.path.clone();
-    let peak_db = candidate.peak_db;
     modal.current = candidate.entry.name.clone();
-    modal.phase = ModalPhase::Normalizing;
+    modal.phase = ModalPhase::Processing;
 
     let (sender, receiver) = mpsc::channel();
     modal.receiver = receiver;
     let cancelled = Arc::clone(&modal.cancelled);
     thread::spawn(move || {
-        let result = loudness::normalize_track(&path, peak_db, &cancelled);
-        let _ = sender.send(NormalizeMessage::NormalizeComplete { index, result });
+        let result = loudness::process_track(&path, &report, &cancelled);
+        let updated_report = if result.is_ok() {
+            loudness::scan_track(&path, &cancelled).ok()
+        } else {
+            None
+        };
+        let _ = sender.send(SidePrepMessage::ProcessComplete {
+            index,
+            report: updated_report,
+            result,
+        });
     });
 }
 
-fn draw_normalization_modal(frame: &mut Frame, modal: &NormalizeModal) {
+fn draw_side_prep_modal(frame: &mut Frame, modal: &SidePrepModal) {
     let area = centered_rect(75, 65, frame.area());
     frame.render_widget(Clear, area);
 
@@ -576,22 +608,22 @@ fn draw_normalization_modal(frame: &mut Frame, modal: &NormalizeModal) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" Normalize Tracks (Esc cancels) "),
+                        .title(" Side Prep Scan (Esc cancels) "),
                 )
                 .ratio(ratio)
                 .label(progress)
                 .gauge_style(Style::default().fg(Color::Green));
             frame.render_widget(gauge, area);
         }
-        ModalPhase::Normalizing => {
+        ModalPhase::Processing => {
             let paragraph = Paragraph::new(format!(
-                "Normalizing {} to a -1 dB peak.\nPress Esc to cancel.",
+                "Applying selected edits to {}.\nPress Esc to cancel.",
                 modal.current
             ))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Normalize Track "),
+                    .title(" Process Track "),
             );
             frame.render_widget(paragraph, area);
         }
@@ -636,23 +668,14 @@ fn draw_normalization_modal(frame: &mut Frame, modal: &NormalizeModal) {
             let items: Vec<ListItem> = modal
                 .candidates
                 .iter()
-                .map(|candidate| {
-                    let state = match &candidate.state {
-                        CandidateState::Pending => "pending".to_string(),
-                        CandidateState::Normalized => "normalized".to_string(),
-                        CandidateState::Failed(error) => format!("failed: {error}"),
-                    };
-                    ListItem::new(format!(
-                        "{}  ({:.1} dB peak)  {state}",
-                        candidate.entry.name, candidate.peak_db
-                    ))
-                })
+                .map(|candidate| ListItem::new(format_candidate(candidate)))
                 .collect();
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(format!(
-                    " Needs normalization ({}) ",
-                    modal.candidates.len()
-                )))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" Side Prep Report ({}) ", modal.candidates.len())),
+                )
                 .highlight_style(
                     Style::default()
                         .bg(Color::DarkGray)
@@ -665,20 +688,61 @@ fn draw_normalization_modal(frame: &mut Frame, modal: &NormalizeModal) {
             }
             frame.render_stateful_widget(list, list_area, &mut list_state);
 
-            let footer = if modal.candidates.is_empty() {
-                format!(
-                    "No tracks need normalization. {} scan error(s). Esc closes.",
-                    modal.errors.len()
-                )
-            } else {
-                format!(
-                    "Enter normalizes selected track | {} scan error(s) | Esc closes",
-                    modal.errors.len()
-                )
+            let selected = modal.candidates.get(modal.selected);
+            let action = match selected {
+                Some(candidate)
+                    if candidate.report.as_ref().is_some_and(|report| {
+                        report.needs_processing()
+                            && !matches!(candidate.state, CandidateState::Processed)
+                    }) =>
+                {
+                    "Enter applies recommended edits"
+                }
+                Some(candidate) if candidate.report.is_some() => "Selected track needs no edits",
+                Some(_) => "Selected track could not be scanned",
+                None => "No tracks scanned",
             };
+            let footer = format!(
+                "{action} | {} scan error(s) | Esc closes",
+                modal.errors.len()
+            );
             frame.render_widget(Paragraph::new(footer), chunks[1]);
         }
     }
+}
+
+fn format_candidate(candidate: &Candidate) -> String {
+    let state = match &candidate.state {
+        CandidateState::Pending => "pending".to_string(),
+        CandidateState::Processed => "processed".to_string(),
+        CandidateState::Failed(error) => format!("failed: {error}"),
+    };
+    let Some(report) = candidate.report.as_ref() else {
+        return format!("{} | no report | {state}", candidate.entry.name);
+    };
+
+    let mut actions = Vec::new();
+    if report.needs_front_trim() {
+        actions.push("trim front");
+    }
+    if report.needs_rear_trim() {
+        actions.push("trim rear");
+    }
+    if report.needs_normalizing() {
+        actions.push("normalize");
+    }
+    let recommendation = if actions.is_empty() {
+        "no edits".to_string()
+    } else {
+        actions.join("+")
+    };
+    format!(
+        "{} | peak {:>6.2} dB | in {:>4.1}s | out {:>4.1}s | {recommendation} | {state}",
+        candidate.entry.name,
+        report.peak_db,
+        report.leading_silence_secs,
+        report.trailing_silence_secs,
+    )
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

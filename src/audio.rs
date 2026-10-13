@@ -1,4 +1,4 @@
-use crate::track::FileEntry;
+use crate::track::{side_sequence_from, FileEntry, TrackSide};
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, OutputStream, Sink, Source};
 use std::fs::File;
@@ -68,11 +68,12 @@ pub fn play_sequence_from(
         return Err("No track selected".to_string());
     };
     // We play to the end of the current side
-    let target_side = match &starting_entry.side {
-        crate::track::TrackSide::SideA(_) => crate::track::TrackSide::SideA(0),
-        crate::track::TrackSide::SideB(_) => crate::track::TrackSide::SideB(0),
-        _ => return Err("Selected entry is not a side track".to_string()),
-    };
+    if !matches!(
+        starting_entry.side,
+        TrackSide::SideA(_) | TrackSide::SideB(_)
+    ) {
+        return Err("Selected entry is not a side track".to_string());
+    }
     // Set up the audio output and player
     let (_stream, handle, sample_rate) = open_output_stream()?;
     let sink = Arc::new(
@@ -80,9 +81,8 @@ pub fn play_sequence_from(
     );
     *control.sink.lock().unwrap() = Some(Arc::clone(&sink));
     // Collect the remaining tracks on the same side starting from the selected track
-    let mut remaining = entries.iter().skip(start_index).filter(|entry| {
-        !entry.is_dir && std::mem::discriminant(&entry.side) == std::mem::discriminant(&target_side)
-    });
+    let sequence = side_sequence_from(entries, start_index);
+    let mut remaining = sequence.iter();
 
     let result = play_tracks(
         &sink,

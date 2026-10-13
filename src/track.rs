@@ -120,9 +120,32 @@ pub fn scan_dir(current_dir: &Path) -> Vec<FileEntry> {
     entries
 }
 
+pub fn side_sequence_from(entries: &[FileEntry], start_index: usize) -> Vec<FileEntry> {
+    let Some(starting_entry) = entries.get(start_index) else {
+        return Vec::new();
+    };
+    if starting_entry.is_dir || matches!(starting_entry.side, TrackSide::Unmatched) {
+        return Vec::new();
+    }
+
+    entries
+        .iter()
+        .skip(start_index)
+        .filter(|entry| !entry.is_dir && same_side(&entry.side, &starting_entry.side))
+        .cloned()
+        .collect()
+}
+
+fn same_side(left: &TrackSide, right: &TrackSide) -> bool {
+    matches!(
+        (left, right),
+        (TrackSide::SideA(_), TrackSide::SideA(_)) | (TrackSide::SideB(_), TrackSide::SideB(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{scan_dir, TrackSide};
+    use super::{scan_dir, side_sequence_from, TrackSide};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -152,6 +175,34 @@ mod tests {
         assert_eq!(entries[2].side, TrackSide::SideA(2));
         assert_eq!(entries[3].side, TrackSide::SideA(10));
         assert_eq!(entries[4].side, TrackSide::SideB(1));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn side_sequence_starts_at_selected_track_and_stops_at_side_end() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "mixtape-side-sequence-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        for name in ["A1.ogg", "A2.ogg", "A3.ogg", "B1.ogg", "notes.txt"] {
+            fs::write(directory.join(name), []).unwrap();
+        }
+
+        let entries = scan_dir(&directory);
+        let start_index = entries
+            .iter()
+            .position(|entry| entry.name == "A2.ogg")
+            .unwrap();
+        let sequence = side_sequence_from(&entries, start_index);
+        let names: Vec<_> = sequence.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["A2.ogg", "A3.ogg"]);
+        assert!(side_sequence_from(&entries, usize::MAX).is_empty());
 
         fs::remove_dir_all(directory).unwrap();
     }
